@@ -1,0 +1,37 @@
+{
+  "version": "2.0",
+  "created": "2026-04-24",
+  "description": "WAF dataset schema (CSV) for raw and labeled request records sourced from PCAP processing",
+  "file_format": "CSV (.csv) with header row, appended per record, rotated daily",
+  "rotation": "daily, filename pattern: dataset/{raw|labeled}/YYYY-MM-DD.csv",
+  "raw_fields": [
+    "request_id",
+    "timestamp",
+    "method",
+    "uri",
+    "host",
+    "user_agent",
+    "content_type",
+    "accept",
+    "referer",
+    "body_truncated",
+    "body_len_original",
+    "source_ip",
+    "source_port",
+    "server_ip",
+    "server_port",
+    "proto",
+    "pcap_file"
+  ],
+  "labeled_extra_fields": [
+    "decision",
+    "threat_score",
+    "confidence",
+    "attack_type",
+    "model_version"
+  ],
+  "privacy": {
+    "masked_headers": ["cookie", "authorization", "x-csrf-token", "x-api-key"],
+    "body_truncation_limit_bytes": 16384
+  }
+}

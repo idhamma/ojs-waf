@@ -1,0 +1,14 @@
+========================================================
+  ML-Based WAF Sidecar Agent (Userspace)  v2.0
+========================================================
+[*] Loading ML model: /home/insomniac/skripsi/support file/ml_training/waf_model.pkl
+[✓] Model loaded — RandomForestClassifier (100 trees, max_depth=10)
+[*] Listening on TCP 0.0.0.0:9999
+[*] Mode         : MONITOR (log only, no blocking)
+[*] Threshold    : 0.7
+[*] Dataset dir  : /home/insomniac/skripsi/support file/dataset
+[*] Model version: rf-v2.0-userspace
+[*] Waiting for connections from Nginx/Lua...
+
+
+[*] SIGTERM received, shutting down... (total=0, blocked=0)

@@ -1,0 +1,71 @@
+{
+  "version": "3.0",
+  "created": "2026-04-25",
+  "description": "WAF dataset schema (CSV) v3 — extended with TCP flags, query params, cookie/auth/x-forwarded-for, and full response fields",
+  "file_format": "CSV (.csv) with header row, appended per record, rotated daily",
+  "rotation": "daily, filename pattern: dataset/{raw|labeled}/YYYY-MM-DD.csv",
+  "raw_fields": [
+    "request_id",
+    "timestamp",
+    "method",
+    "uri",
+    "query_string",
+    "query_params_json",
+    "host",
+    "user_agent",
+    "content_type",
+    "accept",
+    "referer",
+    "cookie_hash",
+    "authorization_type",
+    "x_forwarded_for",
+    "body_truncated",
+    "body_len_original",
+    "source_ip",
+    "source_port",
+    "server_ip",
+    "server_port",
+    "proto",
+    "pcap_file",
+    "tcp_flags",
+    "tcp_flags_str",
+    "response_status",
+    "response_headers_json",
+    "response_size",
+    "response_time_ms",
+    "response_body_truncated",
+    "response_body_len_original"
+  ],
+  "labeled_extra_fields": [
+    "decision",
+    "threat_score",
+    "confidence",
+    "attack_type",
+    "model_version"
+  ],
+  "field_descriptions": {
+    "query_string": "Raw query string portion of URI (after '?'), empty if none",
+    "query_params_json": "JSON-serialized dict of parsed query parameters, e.g. {\"page\": [\"1\"]}",
+    "cookie_hash": "SHA-256 hash of Cookie header value for correlation without exposing sensitive data",
+    "authorization_type": "Authorization scheme only (e.g. 'Bearer', 'Basic'), value stripped for privacy",
+    "x_forwarded_for": "X-Forwarded-For header value (client IP chain)",
+    "tcp_flags": "TCP flags hex value (e.g. '0x0018'), empty if not from PCAP",
+    "tcp_flags_str": "Human-readable TCP flags (e.g. 'PSH,ACK'), empty if not from PCAP",
+    "response_status": "HTTP response status code (e.g. 200, 404), 0 if no response captured",
+    "response_headers_json": "JSON-serialized dict of response headers",
+    "response_size": "Response body size in bytes",
+    "response_time_ms": "Latency in milliseconds (response timestamp - request timestamp), -1 if unavailable",
+    "response_body_truncated": "Response body truncated to 16384 bytes",
+    "response_body_len_original": "Original response body length in bytes"
+  },
+  "privacy": {
+    "masked_headers": ["x-csrf-token", "x-api-key"],
+    "cookie_handling": "SHA-256 hash only (not plaintext)",
+    "authorization_handling": "Scheme type only (e.g. Bearer), token value stripped",
+    "body_truncation_limit_bytes": 16384,
+    "response_body_truncation_limit_bytes": 16384
+  },
+  "backward_compatibility": {
+    "note": "v3 is a superset of v2. New fields are appended after existing v2 fields. Old CSV files (v2) can be loaded by ignoring missing columns."
+  }
+}

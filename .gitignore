@@ -2,3 +2,13 @@
 /__pycache__
 /venv310
 /integrations/docker
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.venv/
+venv/
+dataset/raw/*.csv
+dataset/labeled/*.csv
+!dataset/raw/.gitkeep
+!dataset/labeled/.gitkeep

@@ -41,13 +41,12 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_DIR)
 
-# Import feature extractor from training module
+# Import shared feature extractor
 try:
-    sys.path.insert(0, os.path.join(PROJECT_DIR, "ml_training"))
-    from train_waf_model import extract_features
+    from ml_training.features import extract_features
 except ImportError as e:
     print(f"[!] Error importing ML methods: {e}")
-    print("[!] Pastikan ml_training/train_waf_model.py ada.")
+    print("[!] Pastikan ml_training/features.py ada.")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------

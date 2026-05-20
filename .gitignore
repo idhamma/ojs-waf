@@ -1,5 +1,6 @@
 /.python-version
 /__pycache__
+/unused
 /venv310
 /integrations/docker
 __pycache__/

@@ -1,97 +1,12 @@
 import os
-from typing import List, Dict
-import re
 import numpy as np
 import pandas as pd
 import pickle
-import math
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
-
-def calculate_entropy(data_string):
-    """Calculates the Shannon entropy of a string."""
-    if not data_string:
-        return 0
-    entropy = 0
-    for x in range(256):
-        p_x = float(data_string.count(chr(x))) / len(data_string)
-        if p_x > 0:
-            entropy += - p_x * math.log(p_x, 2)
-    return entropy
-
-def extract_features(method, uri, query_string, body="", headers="", stateful_req_rate=0.0):
-    """
-    Extracts 25 numerical features from raw HTTP components (method, URI, query, body, headers, state).
-    These features must map exactly to how the sidecar agent extracts them.
-    """
-    full_payload = uri + " " + body + " " + headers
-    
-    # Feature 1-4: Lengths
-    uri_len = len(uri)
-    body_len = len(body)
-    header_len = len(headers)
-    full_len = len(full_payload)
-    
-    # Feature 5: Entropy of payload
-    entropy = calculate_entropy(full_payload)
-    
-    # Feature 6-9: Character Distribution
-    num_special_chars = len(re.findall(r'[^a-zA-Z0-9\s]', full_payload))
-    num_quotes = full_payload.count("'") + full_payload.count('"')
-    num_slashes = uri.count("/") + full_payload.count("\\")
-    pct_encoded = full_payload.count('%') / full_len if full_len > 0 else 0
-    
-    # Feature 10-13: Attack Patterns (Signature hits as features)
-    sql_keywords = len(re.findall(r'(?i)\b(SELECT|UNION|INSERT|UPDATE|DELETE|DROP|AND|OR|WHERE)\b', full_payload))
-    xss_patterns = len(re.findall(r'(?i)(<script>|javascript:|onerror=|onload=|eval\()', full_payload))
-    path_traversal = len(re.findall(r'(\.\./|\.\.\\)', full_payload))
-    command_inj = len(re.findall(r'(;|\&\&|\|\||`|\$\()', full_payload))
-    
-    # Feature 14-15: OJS Specific Context
-    # OJS heavily uses /index.php/journal/... and parameters like ?query=
-    has_ojs_structure = 1 if "index.php" in uri else 0
-    ojs_param_abuse = 1 if "query=" in uri and num_special_chars > 5 else 0
-
-    # 1. HTTP Method features (Feature 16-17)
-    method_upper = method.upper() if method else "GET"
-    is_risky_method = 1 if method_upper in ["TRACE", "TRACK", "CONNECT", "PROPFIND", "PUT"] else 0
-    is_post = 1 if method_upper == "POST" else 0
-    
-    # 2. Query anomalies (Feature 18-20)
-    query_params_count = query_string.count("&") + 1 if query_string else 0
-    if query_string and '=' in query_string:
-        parts = query_string.split('&')
-        lengths = [len(p.split('=', 1)[1]) if '=' in p else 0 for p in parts]
-        max_param_length = max(lengths) if lengths else 0
-    else:
-        max_param_length = 0
-    query_entropy = calculate_entropy(query_string)
-
-    # 3. Header anomalies (Feature 21-23)
-    headers_lower = headers.lower() if headers else ""
-    missing_user_agent = 1 if "user-agent:" not in headers_lower else 0
-    missing_host_header = 1 if "host:" not in headers_lower else 0
-    
-    user_agent_match = re.search(r'(?i)user-agent:\s*([^\r\n]*)', headers)
-    user_agent_length = len(user_agent_match.group(1).strip()) if user_agent_match else 0
-    
-    # 4. Payload features (Feature 24)
-    body_non_ascii = len(re.findall(r'[^\x00-\x7F]', body)) if body else 0
-    body_non_ascii_ratio = body_non_ascii / len(body) if len(body) > 0 else 0
-    
-    # 5. Stateful feature (Feature 25)
-    req_rate = float(stateful_req_rate)
-
-    return [
-        uri_len, body_len, header_len, full_len, entropy,
-        num_special_chars, num_quotes, num_slashes, pct_encoded,
-        sql_keywords, xss_patterns, path_traversal, command_inj,
-        has_ojs_structure, ojs_param_abuse,
-        is_risky_method, is_post, query_params_count, max_param_length, query_entropy,
-        missing_user_agent, missing_host_header, user_agent_length, body_non_ascii_ratio, req_rate
-    ]
+from ml_training.features import extract_features, calculate_entropy  # noqa: F401  (re-exported for backwards compat)
 
 def generate_synthetic_dataset():
     """Generates synthetic dataset targeting Open Journal Systems."""

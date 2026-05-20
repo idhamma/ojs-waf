@@ -11,5 +11,13 @@ __pycache__/
 venv/
 dataset/raw/*.csv
 dataset/labeled/*.csv
+dataset/features/*.csv
 !dataset/raw/.gitkeep
 !dataset/labeled/.gitkeep
+!dataset/features/.gitkeep
+
+# Runtime state
+ml_training/waf_model.pkl
+runtime_logs/
+.pytest_cache/
+todo.md

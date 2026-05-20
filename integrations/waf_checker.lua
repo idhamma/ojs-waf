@@ -173,6 +173,12 @@ end
 -- ============================================================================
 
 local function check_request()
+    -- Guard: cegah double-check jika Nginx melakukan internal redirect
+    if ngx.ctx.waf_checked then
+        return
+    end
+    ngx.ctx.waf_checked = true
+
     local request_id = get_request_id()
     local method = ngx.var.request_method
     local uri = ngx.var.uri

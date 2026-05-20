@@ -308,7 +308,14 @@ class SidecarWAF:
         """Heuristic regex to classify attack type for labeling."""
         text = (uri + " " + body).lower()
 
-        if re.search(r"(union\s+select|select\s+\*|or\s+'1'\s*=\s*'1'|drop\s+table)", text):
+        if re.search(
+            r"(union\s+select|select\s+\*"
+            r"|or\s*'?1'?\s*=\s*'?1'?"
+            r"|and\s*'?1'?\s*=\s*'?1'?"
+            r"|or\s+1\s*=\s*1"
+            r"|drop\s+table)",
+            text,
+        ):
             return "SQL_INJECTION"
         if re.search(r"(<script|javascript:|onerror\s*=|onload\s*=|eval\s*\()", text):
             return "XSS"
@@ -317,6 +324,23 @@ class SidecarWAF:
         if re.search(r"(;\s*cat\s|;\s*ls\s|`whoami`|\$\()", text):
             return "COMMAND_INJECTION"
         return "UNKNOWN_ATTACK"
+
+    # ---- Health Check Handler ----
+
+    def _handle_health(self, conn):
+        """Reply to a HEALTH_CHECK probe with sidecar status."""
+        reply = {
+            "type": "HEALTH_RESPONSE",
+            "status": "ok",
+            "model_version": MODEL_VERSION,
+            "total_requests": self._request_count,
+            "total_blocked": self._block_count,
+            "monitor_mode": self.monitor_mode,
+        }
+        try:
+            conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        except Exception as e:
+            print(f"[!] Health reply error: {e}")
 
     # ---- Request Handler ----
 
@@ -469,6 +493,8 @@ class SidecarWAF:
                     msg_type = msg.get("type", "")
                     if msg_type == "REQUEST_CHECK":
                         self.handle_request(msg, conn)
+                    elif msg_type == "HEALTH_CHECK":
+                        self._handle_health(conn)
                     else:
                         print(f"[!] Unknown message type: {msg_type}")
         except ConnectionResetError:

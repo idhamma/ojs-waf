@@ -201,6 +201,17 @@ class TestClassifyAttack:
     def test_command_injection(self):
         assert self.waf._classify_attack("/search?q=test", "`whoami`") == "COMMAND_INJECTION"
 
+    def test_sql_injection_no_space_variant(self):
+        # OR'1'='1 tanpa spasi antara OR dan tanda kutip
+        assert self.waf._classify_attack("/search?q=admin'OR'1'='1", "") == "SQL_INJECTION"
+
+    def test_sql_injection_unquoted_variant(self):
+        # OR 1=1 tanpa tanda kutip
+        assert self.waf._classify_attack("/search?q=x", "' OR 1=1--") == "SQL_INJECTION"
+
+    def test_sql_injection_and_variant(self):
+        assert self.waf._classify_attack("/page?id=1 AND 1=1", "") == "SQL_INJECTION"
+
     def test_unknown_attack(self):
         assert self.waf._classify_attack("/random/path", "some random payload") == "UNKNOWN_ATTACK"
 

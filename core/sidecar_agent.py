@@ -32,7 +32,7 @@ import socket
 import threading
 import numpy as np
 from datetime import datetime, timezone
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -43,22 +43,24 @@ sys.path.insert(0, PROJECT_DIR)
 
 # Import shared feature extractor
 try:
-    from ml_training.features import extract_features
+    from ml_training.features import FEATURE_NAMES, NUM_FEATURES, extract_features
 except ImportError as e:
     print(f"[!] Error importing ML methods: {e}")
     print("[!] Pastikan ml_training/features.py ada.")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Configuration defaults (overridable via CLI)
+# Configuration defaults (overridable via CLI / model bundle)
 # ---------------------------------------------------------------------------
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 9999
-MODEL_VERSION = "rf-v2.0-userspace"
+MODEL_VERSION = "rf-realistic-v1"
 DATASET_BASE_DIR = os.path.join(PROJECT_DIR, "dataset")
 
-# Thresholds for ML prediction probability
-BLOCK_THRESHOLD = 0.70
+# Default block threshold — overridden at load time by the model bundle's
+# `block_threshold` value when present (set by ml_training.train_pipeline
+# from the F1-optimal threshold sweep).
+BLOCK_THRESHOLD = 0.50
 
 # Headers to mask for privacy in dataset
 SENSITIVE_HEADERS = {"cookie", "authorization", "x-csrf-token", "x-api-key"}
@@ -141,6 +143,7 @@ class DatasetWriter:
         "method",
         "uri",
         "query_string",
+        "query_params_json",
         "host",
         "user_agent",
         "content_type",
@@ -155,7 +158,16 @@ class DatasetWriter:
         "source_port",
         "server_ip",
         "server_port",
-        "body_raw",
+        "proto",
+        "pcap_file",
+        "tcp_flags",
+        "tcp_flags_str",
+        "response_status",
+        "response_headers_json",
+        "response_size",
+        "response_time_ms",
+        "response_body_truncated",
+        "response_body_len_original",
         "headers_raw",
     ]
 
@@ -253,17 +265,44 @@ class SidecarWAF:
         self.setup_socket()
 
     def load_model(self):
+        global BLOCK_THRESHOLD
         model_path = os.path.join(PROJECT_DIR, "ml_training", "waf_model.pkl")
         if not os.path.exists(model_path):
             print(f"[!] Model tidak ditemukan: {model_path}")
-            print("[!] Jalankan dulu: python ml_training/train_waf_model.py")
+            print("[!] Jalankan dulu: python -m ml_training.train_pipeline")
             sys.exit(1)
 
         print(f"[*] Loading ML model: {model_path}")
         with open(model_path, "rb") as f:
-            self.model = pickle.load(f)
+            payload = pickle.load(f)
+
+        # Support both new bundle dicts and legacy raw classifier pickles.
+        if isinstance(payload, dict) and "model" in payload:
+            self.model = payload["model"]
+            bundle_names = payload.get("feature_names")
+            if bundle_names is not None and list(bundle_names) != list(FEATURE_NAMES):
+                print("[!] Feature mismatch between sidecar and model bundle.")
+                print(f"    sidecar: {list(FEATURE_NAMES)[:6]}... ({NUM_FEATURES} dims)")
+                print(f"    model  : {list(bundle_names)[:6]}... ({len(bundle_names)} dims)")
+                sys.exit(1)
+            bundle_threshold = payload.get("block_threshold")
+            if isinstance(bundle_threshold, (int, float)):
+                BLOCK_THRESHOLD = float(bundle_threshold)
+                print(f"[*] Block threshold loaded from bundle: {BLOCK_THRESHOLD:.2f}")
+            bundle_version = payload.get("model_version")
+            if bundle_version:
+                print(f"[*] Bundle version: {bundle_version}")
+            trained_at = payload.get("trained_at")
+            if trained_at:
+                print(f"[*] Trained at   : {trained_at}")
+        else:
+            self.model = payload
+            print("[!] Legacy model artifact detected — no feature_names verification.")
+
+        n_est = getattr(self.model, "n_estimators", "?")
+        max_d = getattr(self.model, "max_depth", "?")
         print(f"[✓] Model loaded — {type(self.model).__name__} "
-              f"({self.model.n_estimators} trees, max_depth={self.model.max_depth})")
+              f"({n_est} trees, max_depth={max_d})")
 
     def setup_socket(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -305,23 +344,50 @@ class SidecarWAF:
         return prediction, threat_score, attack_type
 
     def _classify_attack(self, uri, body):
-        """Heuristic regex to classify attack type for labeling."""
-        text = (uri + " " + body).lower()
+        """Heuristic regex to classify attack type for response payload only.
+
+        The output of this function MUST NOT be used as a ground-truth label
+        for retraining — it is a coarse post-hoc tag used when the ML model
+        has already decided BLOCK. URL-decoding is applied so encoded
+        attacks reach the same patterns as their plaintext form.
+        """
+        raw = (uri or "") + " " + (body or "")
+        try:
+            decoded_once = unquote(raw)
+            decoded = unquote(decoded_once)
+        except Exception:
+            decoded = raw
+        text = decoded.lower()
 
         if re.search(
-            r"(union\s+select|select\s+\*"
-            r"|or\s*'?1'?\s*=\s*'?1'?"
-            r"|and\s*'?1'?\s*=\s*'?1'?"
-            r"|or\s+1\s*=\s*1"
-            r"|drop\s+table)",
+            r"(union(\s+all)?\s+select|select\s+.*\s+from"
+            r"|or\s*['\"`]?\s*1\s*['\"`]?\s*=\s*['\"`]?\s*1"
+            r"|and\s*['\"`]?\s*1\s*['\"`]?\s*=\s*['\"`]?\s*1"
+            r"|or\s+1\s*=\s*1|drop\s+table|sleep\s*\(|waitfor\s+delay"
+            r"|benchmark\s*\(|extractvalue\s*\(|updatexml\s*\(|load_file\s*\()",
             text,
         ):
             return "SQL_INJECTION"
-        if re.search(r"(<script|javascript:|onerror\s*=|onload\s*=|eval\s*\()", text):
+        if re.search(
+            r"(<\s*script|<\s*svg|<\s*iframe|<\s*img[^>]*on\w+\s*="
+            r"|javascript\s*:|vbscript\s*:|data\s*:\s*text/html"
+            r"|on(error|load|click|focus|mouseover|toggle)\s*="
+            r"|alert\s*\(|prompt\s*\(|eval\s*\(|srcdoc\s*=)",
+            text,
+        ):
             return "XSS"
-        if re.search(r"(\.\./|\.\.\\|/etc/passwd|/proc/)", text):
+        if re.search(
+            r"(\.\./|\.\.\\|\.{4,}/|/etc/passwd|/etc/shadow|/proc/self"
+            r"|c:\\windows|win\.ini|boot\.ini)",
+            text,
+        ):
             return "PATH_TRAVERSAL"
-        if re.search(r"(;\s*cat\s|;\s*ls\s|`whoami`|\$\()", text):
+        if re.search(
+            r"(`[^`]*`|\$\([^)]*\)|\$\{ifs[^}]*\}|\$ifs\$"
+            r"|(?:[|&;]{1,2}|\s)\s*(?:cat|ls|whoami|id|uname|nc|bash|sh|curl|wget|python|perl|ruby)\b"
+            r"|/bin/sh|/bin/bash|nc\s+-[el])",
+            text,
+        ):
             return "COMMAND_INJECTION"
         return "UNKNOWN_ATTACK"
 
@@ -380,9 +446,10 @@ class SidecarWAF:
 
         # ── Fase 2: Data Sanitization & Masking ──
         masked_body = _mask_sensitive_body(body[:16384])
+        masked_headers_dict = mask_headers(headers)
 
         # ── Async Logging: Write raw dataset record ──
-        subset = headers_subset(mask_headers(headers))
+        subset = headers_subset(masked_headers_dict)
         flat = _flatten_headers_subset(subset)
         raw_record = {
             "request_id": request_id,
@@ -390,18 +457,28 @@ class SidecarWAF:
             "method": method,
             "uri": uri,
             "query_string": query_string,
+            "query_params_json": "{}",
             **flat,
             "cookie_hash": cookie_hash,
             "authorization_type": authorization_type,
-             "x_forwarded_for": x_forwarded_for,
+            "x_forwarded_for": x_forwarded_for,
             "body_truncated": masked_body,
             "body_len_original": len(body),
             "source_ip": source_ip,
             "source_port": source_port,
             "server_ip": server_ip,
             "server_port": server_port,
-            "body_raw": body,
-            "headers_raw": json.dumps(headers),
+            "proto": "TCP",
+            "pcap_file": "",
+            "tcp_flags": "",
+            "tcp_flags_str": "",
+            "response_status": 0,
+            "response_headers_json": "{}",
+            "response_size": 0,
+            "response_time_ms": -1,
+            "response_body_truncated": "",
+            "response_body_len_original": 0,
+            "headers_raw": json.dumps(masked_headers_dict),
         }
         self.dataset.write_raw(raw_record)
 
@@ -418,8 +495,7 @@ class SidecarWAF:
             decision = "PASS"
             attack_type = "NONE"
 
-        # Monitor mode override: always return PASS to Lua,
-        # but keep the REAL decision in the labeled dataset for training.
+        # Monitor mode override: always return PASS to Lua
         effective_decision = decision
         if self.monitor_mode and decision == "BLOCK":
             effective_decision = "PASS"
@@ -448,9 +524,14 @@ class SidecarWAF:
             print(f"[!] Reply send error: {e}")
 
         # ── Async Logging: Write labeled dataset record ──
+        # NOTE: we persist the model's decision (not a downstream regex) so
+        # retraining on this log measures the ML signal itself rather than
+        # reinforcing a fixed rule catalog. The rule classifier is only used
+        # to populate the human-readable attack_type tag *when the model has
+        # already chosen BLOCK*.
         labeled_record = {
             **raw_record,
-            "decision": decision,  # REAL decision (not monitor-overridden)
+            "decision": decision,
             "threat_score": round(threat_score, 4),
             "confidence": round(confidence, 4),
             "attack_type": attack_type,

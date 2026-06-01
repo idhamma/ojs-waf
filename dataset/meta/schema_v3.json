@@ -34,7 +34,8 @@
     "response_size",
     "response_time_ms",
     "response_body_truncated",
-    "response_body_len_original"
+    "response_body_len_original",
+    "headers_raw"
   ],
   "labeled_extra_fields": [
     "decision",

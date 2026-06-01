@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+*.csv
 .venv/
 venv/
 dataset/raw/*.csv
@@ -21,3 +22,4 @@ ml_training/waf_model.pkl
 runtime_logs/
 .pytest_cache/
 todo.md
+.claude

@@ -12,9 +12,6 @@ __pycache__/
 .env
 .venv/
 venv/
-!dataset/raw/.gitkeep
-!dataset/labeled/.gitkeep
-!dataset/features/.gitkeep
 
 # Runtime state
 ml_training/waf_model.pkl

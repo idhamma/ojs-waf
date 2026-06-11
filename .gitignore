@@ -1,18 +1,14 @@
 /.python-version
 /__pycache__
-/unused
-/venv310
-/integrations/docker
+/venv
 __pycache__/
 *.pyc
 *.pyo
 *.log
 *.csv
+.env
 .venv/
 venv/
-dataset/raw/*.csv
-dataset/labeled/*.csv
-dataset/features/*.csv
 !dataset/raw/.gitkeep
 !dataset/labeled/.gitkeep
 !dataset/features/.gitkeep
@@ -23,3 +19,5 @@ runtime_logs/
 .pytest_cache/
 todo.md
 .claude
+.copilot
+.vscode-server

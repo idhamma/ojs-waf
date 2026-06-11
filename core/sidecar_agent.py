@@ -5,13 +5,20 @@ Menerima REQUEST_CHECK dari Nginx/Lua melalui TCP socket,
 menjalankan ML inference (Random Forest), dan membalas WAF_DECISION.
 Data request dicatat ke CSV untuk keperluan audit dan retraining model.
 
-Arsitektur:
-    Nginx (Lua) ──TCP──▶ sidecar_agent.py ──TCP──▶ Nginx (Lua)
-                  JSON                        JSON
+Arsitektur (Bare Metal / Non-Docker):
+    Client → OpenResty (port 80) → waf_checker.lua
+                  │ TCP :9999 (JSON)
+                  ▼
+             sidecar_agent.py (host)
+                  │
+                  ▼
+             Apache (port 8080) → OJS (/var/www/ojs)
 
 Mode:
-    --monitor  : Log semua keputusan tetapi selalu PASS (untuk dataset collection)
-    (default)  : Enforce — BLOCK request yang terdeteksi anomali
+    --monitor  : Log semua request ke CSV, selalu PASS — tidak perlu model ML.
+                 Gunakan ini untuk FASE 1 (pengumpulan dataset).
+    (default)  : Enforce — BLOCK request anomali berdasarkan model ML.
+                 Membutuhkan waf_model.pkl yang sudah dilatih.
 
 Blocking = DROP: sidecar mengembalikan decision BLOCK, Nginx langsung
 memutus koneksi tanpa mengirim response (ngx.exit 444). Tidak ada
@@ -268,6 +275,12 @@ class SidecarWAF:
         global BLOCK_THRESHOLD
         model_path = os.path.join(PROJECT_DIR, "ml_training", "waf_model.pkl")
         if not os.path.exists(model_path):
+            if self.monitor_mode:
+                print(f"[!] Model tidak ditemukan: {model_path}")
+                print("[!] Monitor/record mode: berjalan TANPA model ML.")
+                print("[!] Semua traffic akan dicatat ke CSV (Phase 1 — dataset collection).")
+                self.model = None
+                return
             print(f"[!] Model tidak ditemukan: {model_path}")
             print("[!] Jalankan dulu: python -m ml_training.train_pipeline")
             sys.exit(1)
@@ -315,6 +328,10 @@ class SidecarWAF:
 
     def predict(self, method, uri, query_string, body, headers_str, source_ip):
         """Run ML inference and return (prediction, probability, attack_type)."""
+        if self.model is None:
+            # No model loaded — monitor/record mode (Phase 1). Always PASS.
+            return 0, 0.0, "NONE"
+
         now = datetime.now(timezone.utc).timestamp()
         
         # Cleanup old timestamps (keep last 60 seconds rolling window)

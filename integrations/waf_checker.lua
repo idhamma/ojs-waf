@@ -1,13 +1,17 @@
 -- waf_checker.lua
--- ML-Based WAF Checker — Nginx/Lua Integration (Userspace)
+-- ML-Based WAF Checker — OpenResty/Lua Integration (Bare Metal)
 --
--- Dijalankan di dalam Docker container OJS via OpenResty.
+-- Dijalankan di OpenResty yang berjalan di host (tanpa Docker).
 -- Mencegat setiap HTTP request, mengirim payload ke Python sidecar
--- untuk ML inference, dan mengeksekusi keputusan:
---   PASS  → request diteruskan ke PHP-FPM (OJS)
+-- untuk ML inference / recording, dan mengeksekusi keputusan:
+--   PASS  → request diteruskan ke Apache (OJS)
 --   BLOCK → koneksi langsung di-DROP tanpa response (ngx.exit 444)
 --
--- Sidecar berjalan di host, diakses via Docker gateway IP (172.19.0.1:9999)
+-- Phase 1 (dataset collection): jalankan sidecar dengan --monitor
+--   python core/sidecar_agent.py --monitor
+--   → semua traffic dicatat ke CSV, tidak ada yang di-BLOCK
+--
+-- Sidecar berjalan di host yang sama (127.0.0.1:9999)
 
 local cjson = require("cjson.safe")
 
@@ -15,8 +19,8 @@ local cjson = require("cjson.safe")
 -- Configuration
 -- ============================================================================
 
--- Sidecar agent address: host gateway dari sudut pandang container
-local WAF_AGENT_HOST = os.getenv("WAF_AGENT_HOST") or "172.19.0.1"
+-- Sidecar agent berjalan di host yang sama (bare metal, non-Docker)
+local WAF_AGENT_HOST = os.getenv("WAF_AGENT_HOST") or "127.0.0.1"
 local WAF_AGENT_PORT = tonumber(os.getenv("WAF_AGENT_PORT")) or 9999
 local WAF_TIMEOUT_MS = 2000
 local MAX_BODY_SIZE  = 16384   -- 16KB body dikirim ke sidecar
@@ -250,7 +254,7 @@ local function check_request()
         return ngx.exit(444)
     end
 
-    -- PASS: request diteruskan ke PHP-FPM (upstream OJS)
+    -- PASS: request diteruskan ke Apache/OJS upstream
 end
 
 -- ============================================================================

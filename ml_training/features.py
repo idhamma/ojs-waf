@@ -138,9 +138,13 @@ _SQL_KEYWORDS = re.compile(
 _SQL_METACHARS = re.compile(r"(--|#|/\*|\*/|;|\bOR\s+|\bAND\s+)")
 
 # Boolean tautology detector — handles spaced, quoted, and bare-int forms.
+# Whitespace and word-char runs use possessive quantifiers (`*+`/`++`) so a
+# padded payload with a long space run cannot cause catastrophic backtracking
+# (ReDoS). Match semantics for real tautologies are unchanged because the
+# delimiters (=, quotes, OR/AND) are disjoint from the possessive classes.
 _SQL_TAUTOLOGY = re.compile(
     r"(?i)("
-    r"['\"`]?\s*\)?\s*(OR|AND)\s+[\"'`]?[\w%]+[\"'`]?\s*=\s*[\"'`]?[\w%]+[\"'`]?"
+    r"['\"`]?\s*+\)?\s*+(OR|AND)\s++[\"'`]?[\w%]++[\"'`]?\s*+=\s*+[\"'`]?[\w%]++[\"'`]?"
     r"|\b(OR|AND)\s+TRUE\b"
     r"|\b(OR|AND)\s+\d+\s*(>|<|>=|<=|!=|<>)\s*\d+"
     r")"
@@ -179,10 +183,13 @@ _PATH_TRAVERSAL = re.compile(
 )
 
 # Command injection — shell metachars, IFS-bypass, common payload binaries.
+# NOTE: the separator before a command keyword uses a possessive `\s*+` so a
+# long run of whitespace (e.g. a padded request body) cannot trigger
+# catastrophic backtracking / ReDoS in the WAF's own feature extractor.
 _CMD_INJ = re.compile(
     r"(?i)("
     r"`[^`]*`|\$\([^)]*\)|"  # backticks, $()
-    r"(?:[|&;]{1,2}|\s)\s*(ls|cat|whoami|id|uname|ps|netstat|ifconfig|route|"
+    r"(?:[|&;]{1,2}|\s)\s*+(ls|cat|whoami|id|uname|ps|netstat|ifconfig|route|"
     r"curl|wget|nc|bash|sh|zsh|dash|python|perl|ruby|powershell|cmd)\b|"
     r"\bnc\s+-[el]|/bin/sh|/bin/bash|"
     r"\$\{IFS[^}]*\}|\$IFS\$|\${PATH}"

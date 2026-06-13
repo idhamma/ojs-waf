@@ -57,6 +57,7 @@ from ml_training.features import FEATURE_NAMES, NUM_FEATURES, extract_features
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = PROJECT_DIR / "ml_training" / "waf_model.pkl"
 DATASET_OUTPUT_DIR = PROJECT_DIR / "dataset" / "synthetic"
+CSV_DATASET_PATH = PROJECT_DIR / "ml_training" / "data_train" / "labeled" / "merge.csv"
 
 MODEL_VERSION = "rf-realistic-v1"
 
@@ -135,10 +136,15 @@ def print_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> None:
 
 
 def print_per_attack_recall(
-    attack_labels_test: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray
+    attack_labels_test: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    attack_types: list[str] | None = None,
 ) -> None:
+    if attack_types is None:
+        attack_types = list(ATTACK_TYPES)
     print("\n  Per-Attack-Type Recall:")
-    for atype in ATTACK_TYPES:
+    for atype in attack_types:
         mask = (attack_labels_test == atype)
         if mask.sum() == 0:
             continue
@@ -357,27 +363,38 @@ def run_pipeline(
     config: TrainingConfig,
     write_dataset: bool = False,
     show_threshold_sweep: bool = False,
+    csv_path: Path | None = None,
 ) -> None:
     print("=" * 64)
     print(f"  WAF ML Training Pipeline ({MODEL_VERSION})")
     print("=" * 64)
 
-    print(
-        f"[*] Synthesizing dataset: n_benign={config.n_benign}  "
-        f"n_attack_per_type={config.n_attack_per_type}  seed={config.seed}"
-    )
-    df = generate_dataset(
-        n_benign=config.n_benign,
-        n_attack_per_type=config.n_attack_per_type,
-        seed=config.seed,
-    )
-    counts = df["attack_type"].value_counts().to_dict()
-    print(f"    Class distribution: {counts}")
+    if csv_path is not None:
+        print(f"[*] Loading real dataset: {csv_path}")
+        df = pd.read_csv(csv_path)
+        counts = df["attack_type"].value_counts().to_dict()
+        print(f"    Rows: {len(df)}  Class distribution: {counts}")
+        active_attack_types = sorted(
+            t for t in df["attack_type"].unique() if t != "NONE"
+        )
+    else:
+        print(
+            f"[*] Synthesizing dataset: n_benign={config.n_benign}  "
+            f"n_attack_per_type={config.n_attack_per_type}  seed={config.seed}"
+        )
+        df = generate_dataset(
+            n_benign=config.n_benign,
+            n_attack_per_type=config.n_attack_per_type,
+            seed=config.seed,
+        )
+        counts = df["attack_type"].value_counts().to_dict()
+        print(f"    Class distribution: {counts}")
+        active_attack_types = list(ATTACK_TYPES)
 
-    if write_dataset:
-        raw_path, labeled_path = write_schema_v3_csvs(df, DATASET_OUTPUT_DIR)
-        print(f"    Raw CSV     -> {raw_path}")
-        print(f"    Labeled CSV -> {labeled_path}")
+        if write_dataset:
+            raw_path, labeled_path = write_schema_v3_csvs(df, DATASET_OUTPUT_DIR)
+            print(f"    Raw CSV     -> {raw_path}")
+            print(f"    Labeled CSV -> {labeled_path}")
 
     print("[*] Extracting features...")
     X, y, attack_labels = build_feature_matrix(df)
@@ -427,7 +444,7 @@ def run_pipeline(
     print(classification_report(
         y_test, y_pred_default, target_names=["PASS", "BLOCK"], zero_division=0
     ))
-    print_per_attack_recall(atk_test, y_test, y_pred_default)
+    print_per_attack_recall(atk_test, y_test, y_pred_default, active_attack_types)
 
     best_thresh = threshold_sweep(y_test, y_proba)
     y_pred_best = (y_proba >= best_thresh).astype(int)
@@ -435,7 +452,7 @@ def run_pipeline(
     print(f"  Precision: {precision_score(y_test, y_pred_best, zero_division=0):.4f}")
     print(f"  Recall   : {recall_score(y_test, y_pred_best, zero_division=0):.4f}")
     print(f"  F1       : {f1_score(y_test, y_pred_best, zero_division=0):.4f}")
-    print_per_attack_recall(atk_test, y_test, y_pred_best)
+    print_per_attack_recall(atk_test, y_test, y_pred_best, active_attack_types)
 
     run_smoke_tests(clf, best_thresh)
 
@@ -443,7 +460,7 @@ def run_pipeline(
         "model": clf,
         "feature_names": list(FEATURE_NAMES),
         "block_threshold": float(best_thresh),
-        "attack_types": list(ATTACK_TYPES),
+        "attack_types": active_attack_types,
         "model_version": MODEL_VERSION,
         "trained_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -469,9 +486,21 @@ def main() -> None:
     parser.add_argument("--max-depth", type=int, default=14)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--csv-path",
+        type=Path,
+        default=CSV_DATASET_PATH,
+        help="Path to labeled CSV dataset (default: ml_training/data_train/labeled/merge.csv). "
+             "Pass --no-csv to use synthetic data instead.",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Ignore --csv-path and generate a synthetic dataset instead.",
+    )
+    parser.add_argument(
         "--write-dataset",
         action="store_true",
-        help="Also write the generated dataset to dataset/synthetic/{raw,labeled}/",
+        help="Write the generated synthetic dataset to dataset/synthetic/ (ignored with --csv-path).",
     )
     parser.add_argument(
         "--threshold-sweep",
@@ -479,6 +508,13 @@ def main() -> None:
         help="Show full precision/recall/F1 table across thresholds.",
     )
     args = parser.parse_args()
+
+    csv_path: Path | None = None
+    if not args.no_csv:
+        p = args.csv_path
+        if not p.exists():
+            parser.error(f"CSV dataset not found: {p}  (use --no-csv for synthetic data)")
+        csv_path = p
 
     config = TrainingConfig(
         n_benign=args.n_benign,
@@ -491,6 +527,7 @@ def main() -> None:
         config,
         write_dataset=args.write_dataset,
         show_threshold_sweep=args.threshold_sweep,
+        csv_path=csv_path,
     )
 
 

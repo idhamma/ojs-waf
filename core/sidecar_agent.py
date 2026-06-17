@@ -50,7 +50,12 @@ sys.path.insert(0, PROJECT_DIR)
 
 # Import shared feature extractor
 try:
-    from ml_training.features import FEATURE_NAMES, NUM_FEATURES, extract_features
+    from ml_training.features import (
+        FEATURE_NAMES,
+        NUM_FEATURES,
+        extract_features,
+        selected_feature_indices,
+    )
 except ImportError as e:
     print(f"[!] Error importing ML methods: {e}")
     print("[!] Pastikan ml_training/features.py ada.")
@@ -264,6 +269,10 @@ class SidecarWAF:
         self.port = port
         self.monitor_mode = monitor_mode
         self.model = None
+        # Column indices projecting the full 33-dim feature vector down to the
+        # subset the loaded model was trained on. Defaults to identity (all 33)
+        # and is narrowed in load_model() from the bundle's feature_names.
+        self.feature_indices = list(range(NUM_FEATURES))
         self.dataset = DatasetWriter(DATASET_BASE_DIR)
         self._request_count = 0
         self._block_count = 0
@@ -293,11 +302,23 @@ class SidecarWAF:
         if isinstance(payload, dict) and "model" in payload:
             self.model = payload["model"]
             bundle_names = payload.get("feature_names")
-            if bundle_names is not None and list(bundle_names) != list(FEATURE_NAMES):
-                print("[!] Feature mismatch between sidecar and model bundle.")
-                print(f"    sidecar: {list(FEATURE_NAMES)[:6]}... ({NUM_FEATURES} dims)")
-                print(f"    model  : {list(bundle_names)[:6]}... ({len(bundle_names)} dims)")
-                sys.exit(1)
+            if bundle_names is not None:
+                # The bundle may train on a subset of the 33-dim vector (e.g. the
+                # real-data model uses 22 features). Verify every bundle feature
+                # is one the sidecar can produce, then store the projection so
+                # predict() feeds the model exactly the columns it was trained on.
+                try:
+                    self.feature_indices = selected_feature_indices(list(bundle_names))
+                except KeyError as exc:
+                    print("[!] Feature mismatch between sidecar and model bundle.")
+                    print(f"    sidecar can produce: {list(FEATURE_NAMES)[:6]}... "
+                          f"({NUM_FEATURES} dims)")
+                    print(f"    bundle requires    : {list(bundle_names)[:6]}... "
+                          f"({len(bundle_names)} dims)")
+                    print(f"    unknown feature(s) : {exc}")
+                    sys.exit(1)
+                print(f"[*] Model uses {len(self.feature_indices)}/{NUM_FEATURES} "
+                      f"features (projected from the shared extractor).")
             bundle_threshold = payload.get("block_threshold")
             if isinstance(bundle_threshold, (int, float)):
                 BLOCK_THRESHOLD = float(bundle_threshold)
@@ -348,7 +369,8 @@ class SidecarWAF:
             headers=headers_str,
             stateful_req_rate=stateful_req_rate
         )
-        X = np.array([features])
+        # Project the full 33-dim vector down to the model's trained subset.
+        X = np.array([[features[i] for i in self.feature_indices]])
 
         prediction = self.model.predict(X)[0]           # 0=Normal, 1=Attack
         probabilities = self.model.predict_proba(X)[0]   # [p_normal, p_attack]
@@ -376,6 +398,14 @@ class SidecarWAF:
             decoded = raw
         text = decoded.lower()
 
+        # RCE in this OJS deployment is abuse of the native import/export plugin
+        # route (the only RCE family present in the captured dataset). Checked
+        # first so genuine import-route attacks are tagged RCE, not UNKNOWN.
+        if re.search(
+            r"(nativeimportexportplugin|management/importexport|/importexport/plugin)",
+            text,
+        ):
+            return "RCE"
         if re.search(
             r"(union(\s+all)?\s+select|select\s+.*\s+from"
             r"|or\s*['\"`]?\s*1\s*['\"`]?\s*=\s*['\"`]?\s*1"

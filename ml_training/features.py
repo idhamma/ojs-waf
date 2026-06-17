@@ -71,6 +71,92 @@ NUM_FEATURES = len(FEATURE_NAMES)  # 33
 
 
 # ---------------------------------------------------------------------------
+# Real-dataset feature subset (XSS + RCE + Normal only)
+# ---------------------------------------------------------------------------
+#
+# The captured OJS dataset contains only two attack families — XSS (payload in
+# the POST body of `$$$call$$$` grid routes) and RCE (abuse of the
+# `NativeImportExportPlugin` import route). It has NO SQLi, path traversal, or
+# command injection, so the detectors for those families carry no signal and
+# are dropped from the *model* (the 33-dim extractor itself is unchanged, so
+# the regex tests and the synthetic pipeline keep working).
+#
+# Five IP/User-Agent–derived features are also dropped: in the raw capture all
+# attacks originate from a single IP and User-Agent, so keeping them would let
+# the model "cheat" by memorising the attacker's identity instead of learning
+# the payload (metadata leakage). Dropping them is equivalent to — and simpler
+# than — neutralising those columns, and it needs no merge step.
+#
+# `extract_features` still returns the full 33-dim vector; training and the
+# sidecar select these columns via `selected_feature_indices`. The model bundle
+# stores this list as `feature_names`, and the sidecar rebuilds the same
+# projection at load time, so parity is verified end-to-end.
+REALDATA_FEATURE_NAMES: List[str] = [
+    # Method
+    "method_get",
+    "method_post",
+    "is_risky_method",
+    # URI structure
+    "uri_len",
+    "path_depth",
+    "num_slashes",
+    "pct_encoded_ratio",
+    "double_pct_encoded",
+    "uri_entropy",
+    "uri_special_char_ratio",
+    # Query
+    "query_len",
+    "query_entropy",
+    "query_param_count",
+    "max_param_len",
+    # Attack signals present in the data (XSS in body / encoded markers)
+    "xss_pattern_count",
+    "encoded_attack_markers",
+    # OJS route awareness (carries the RCE import-route + $$$call$$$ signal)
+    "has_index_php",
+    "ojs_page_code",
+    "ojs_op_code",
+    "has_ojs_ajax",
+    # Body / behavior
+    "body_len",
+    "body_non_ascii_ratio",
+]
+
+# Features intentionally removed from the real-data model, grouped by reason.
+DROPPED_FEATURE_NAMES: List[str] = [
+    # Attack families absent from the dataset
+    "sql_keyword_count",
+    "sql_metachar_count",
+    "sql_tautology",
+    "sql_time_based",
+    "path_traversal_count",
+    "command_inj_count",
+    # IP / User-Agent leakage (single attacker IP+UA in the raw capture)
+    "missing_host_header",
+    "missing_user_agent",
+    "bot_user_agent",
+    "user_agent_length",
+    "req_rate",
+]
+
+NUM_REALDATA_FEATURES = len(REALDATA_FEATURE_NAMES)  # 22
+
+
+def selected_feature_indices(names: List[str]) -> List[int]:
+    """Map a list of feature names to their column indices in the full vector.
+
+    Raises ``KeyError`` if any requested name is not produced by
+    ``extract_features`` — this is the runtime parity guard the sidecar relies
+    on when projecting the 33-dim vector down to a model's training subset.
+    """
+    index_of = {name: i for i, name in enumerate(FEATURE_NAMES)}
+    missing = [n for n in names if n not in index_of]
+    if missing:
+        raise KeyError(f"Unknown feature names: {missing}")
+    return [index_of[n] for n in names]
+
+
+# ---------------------------------------------------------------------------
 # OJS route vocabulary (kept small; an "unknown" code is reserved for OOV)
 # ---------------------------------------------------------------------------
 

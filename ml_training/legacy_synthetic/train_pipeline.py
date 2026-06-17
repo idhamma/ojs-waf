@@ -47,17 +47,17 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from ml_training.dataset_generator import (
+from ml_training.legacy_synthetic.dataset_generator import (
     ATTACK_TYPES,
     generate_dataset,
     write_schema_v3_csvs,
 )
 from ml_training.features import FEATURE_NAMES, NUM_FEATURES, extract_features
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH = PROJECT_DIR / "ml_training" / "waf_model.pkl"
 DATASET_OUTPUT_DIR = PROJECT_DIR / "dataset" / "synthetic"
-CSV_DATASET_PATH = PROJECT_DIR / "ml_training" / "data_train" / "labeled" / "merge.csv"
+CSV_DATASET_PATH = PROJECT_DIR / "ml_training" / "legacy_synthetic" / "merge.csv"
 
 MODEL_VERSION = "rf-realistic-v1"
 
